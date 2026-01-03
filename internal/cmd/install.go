@@ -242,7 +242,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("  %d. Add a rig: %s\n", step, style.Dim.Render("gt rig add <name> <git-url>"))
 	step++
-	fmt.Printf("  %d. Start the Mayor: %s\n", step, style.Dim.Render("cd "+absPath+" && gt prime"))
+	fmt.Printf("  %d. Enter the Mayor's office: %s\n", step, style.Dim.Render("gt mayor attach"))
 
 	return nil
 }
@@ -261,8 +261,8 @@ func createMayorCLAUDEmd(hqRoot, townRoot string) error {
 		TownRoot:      townRoot,
 		TownName:      townName,
 		WorkDir:       hqRoot,
-		MayorSession:  session.MayorSessionName(townName),
-		DeaconSession: session.DeaconSessionName(townName),
+		MayorSession:  session.MayorSessionName(),
+		DeaconSession: session.DeaconSessionName(),
 	}
 
 	content, err := tmpl.RenderRole("mayor", data)
