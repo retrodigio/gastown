@@ -61,7 +61,7 @@ func looksLikeIssueID(s string) bool {
 // Convoy command flags
 var (
 	convoyMolecule     string
-	convoyNotify       string
+	convoySubscribe    []string // Multiple subscribers supported
 	convoyStatusJSON   bool
 	convoyListJSON     bool
 	convoyListStatus   string
@@ -120,8 +120,9 @@ issues across any rig.
 
 Examples:
   gt convoy create "Deploy v2.0" gt-abc bd-xyz
-  gt convoy create "Release prep" gt-abc --notify           # defaults to mayor/
-  gt convoy create "Release prep" gt-abc --notify ops/      # notify ops/
+  gt convoy create "Release prep" gt-abc --subscribe           # defaults to mayor/
+  gt convoy create "Release prep" gt-abc --subscribe ops/      # subscribe ops/
+  gt convoy create "Feature rollout" gt-a --subscribe mayor/ --subscribe human@email.com
   gt convoy create "Feature rollout" gt-a gt-b gt-c --molecule mol-release`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runConvoyCreate,
@@ -199,11 +200,29 @@ Examples:
 	RunE: runConvoyStranded,
 }
 
+var convoySubscribeCmd = &cobra.Command{
+	Use:   "subscribe <convoy-id> <address> [address...]",
+	Short: "Subscribe addresses to convoy completion notifications",
+	Long: `Add subscribers to a convoy to be notified when it completes.
+
+When all tracked issues are closed, a mail notification is sent to
+each subscriber. Addresses can be:
+  - Agent addresses: mayor/, deacon/, gastown/polecats/nux, etc.
+  - Email addresses: human@example.com
+
+Examples:
+  gt convoy subscribe hq-cv-abc mayor/              # Subscribe mayor
+  gt convoy subscribe hq-cv-abc human@email.com     # Subscribe email
+  gt convoy subscribe hq-cv-abc mayor/ deacon/      # Multiple subscribers`,
+	Args: cobra.MinimumNArgs(2),
+	RunE: runConvoySubscribe,
+}
+
 func init() {
 	// Create flags
 	convoyCreateCmd.Flags().StringVar(&convoyMolecule, "molecule", "", "Associated molecule ID")
-	convoyCreateCmd.Flags().StringVar(&convoyNotify, "notify", "", "Address to notify on completion (default: mayor/ if flag used without value)")
-	convoyCreateCmd.Flags().Lookup("notify").NoOptDefVal = "mayor/"
+	convoyCreateCmd.Flags().StringArrayVar(&convoySubscribe, "subscribe", nil, "Address to notify on completion (can be repeated, default: mayor/ if flag used without value)")
+	convoyCreateCmd.Flags().Lookup("subscribe").NoOptDefVal = "mayor/"
 
 	// Status flags
 	convoyStatusCmd.Flags().BoolVar(&convoyStatusJSON, "json", false, "Output as JSON")
@@ -227,6 +246,7 @@ func init() {
 	convoyCmd.AddCommand(convoyAddCmd)
 	convoyCmd.AddCommand(convoyCheckCmd)
 	convoyCmd.AddCommand(convoyStrandedCmd)
+	convoyCmd.AddCommand(convoySubscribeCmd)
 
 	rootCmd.AddCommand(convoyCmd)
 }
@@ -263,8 +283,8 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 
 	// Create convoy issue in town beads
 	description := fmt.Sprintf("Convoy tracking %d issues", len(trackedIssues))
-	if convoyNotify != "" {
-		description += fmt.Sprintf("\nNotify: %s", convoyNotify)
+	if len(convoySubscribe) > 0 {
+		description += fmt.Sprintf("\nSubscribers: %s", strings.Join(convoySubscribe, ", "))
 	}
 	if convoyMolecule != "" {
 		description += fmt.Sprintf("\nMolecule: %s", convoyMolecule)
@@ -317,8 +337,8 @@ func runConvoyCreate(cmd *cobra.Command, args []string) error {
 	if len(trackedIssues) > 0 {
 		fmt.Printf("  Issues:   %s\n", strings.Join(trackedIssues, ", "))
 	}
-	if convoyNotify != "" {
-		fmt.Printf("  Notify:   %s\n", convoyNotify)
+	if len(convoySubscribe) > 0 {
+		fmt.Printf("  Subscribers: %s\n", strings.Join(convoySubscribe, ", "))
 	}
 	if convoyMolecule != "" {
 		fmt.Printf("  Molecule: %s\n", convoyMolecule)
@@ -547,6 +567,184 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 	return stranded, nil
 }
 
+// runConvoySubscribe adds subscribers to an existing convoy.
+func runConvoySubscribe(cmd *cobra.Command, args []string) error {
+	convoyID := args[0]
+	newSubscribers := args[1:]
+
+	townBeads, err := getTownBeadsDir()
+	if err != nil {
+		return err
+	}
+
+	// Get current convoy description
+	showArgs := []string{"show", convoyID, "--json"}
+	showCmd := exec.Command("bd", showArgs...)
+	showCmd.Dir = townBeads
+	var stdout bytes.Buffer
+	showCmd.Stdout = &stdout
+
+	if err := showCmd.Run(); err != nil {
+		return fmt.Errorf("convoy '%s' not found", convoyID)
+	}
+
+	var convoys []struct {
+		ID          string `json:"id"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Type        string `json:"issue_type"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &convoys); err != nil {
+		return fmt.Errorf("parsing convoy data: %w", err)
+	}
+
+	if len(convoys) == 0 {
+		return fmt.Errorf("convoy '%s' not found", convoyID)
+	}
+
+	convoy := convoys[0]
+
+	// Verify it's actually a convoy
+	if convoy.Type != "convoy" {
+		return fmt.Errorf("'%s' is not a convoy (type: %s)", convoyID, convoy.Type)
+	}
+
+	// Parse existing subscribers from description
+	existingSubscribers := getSubscribersFromDescription(convoy.Description)
+
+	// Merge with new subscribers (avoid duplicates)
+	subscriberSet := make(map[string]bool)
+	for _, s := range existingSubscribers {
+		subscriberSet[s] = true
+	}
+	var addedSubscribers []string
+	for _, s := range newSubscribers {
+		if !subscriberSet[s] {
+			subscriberSet[s] = true
+			addedSubscribers = append(addedSubscribers, s)
+		}
+	}
+
+	if len(addedSubscribers) == 0 {
+		fmt.Printf("All addresses are already subscribed to convoy %s\n", convoyID)
+		return nil
+	}
+
+	// Build new subscriber list
+	var allSubscribers []string
+	for s := range subscriberSet {
+		allSubscribers = append(allSubscribers, s)
+	}
+
+	// Update description with new subscriber list
+	newDesc := updateSubscribersInDescription(convoy.Description, allSubscribers)
+
+	// Update the convoy
+	updateArgs := []string{"update", convoyID, "--description=" + newDesc}
+	updateCmd := exec.Command("bd", updateArgs...)
+	updateCmd.Dir = townBeads
+	if err := updateCmd.Run(); err != nil {
+		return fmt.Errorf("updating convoy subscribers: %w", err)
+	}
+
+	fmt.Printf("%s Added %d subscriber(s) to convoy 🚚 %s\n", style.Bold.Render("✓"), len(addedSubscribers), convoyID)
+	fmt.Printf("  Added:       %s\n", strings.Join(addedSubscribers, ", "))
+	fmt.Printf("  Subscribers: %s\n", strings.Join(allSubscribers, ", "))
+
+	return nil
+}
+
+// getSubscribersFromDescription parses subscribers from convoy description.
+// Returns empty slice if no subscribers found.
+func getSubscribersFromDescription(desc string) []string {
+	for _, line := range strings.Split(desc, "\n") {
+		if strings.HasPrefix(line, "Subscribers: ") {
+			subscriberList := strings.TrimPrefix(line, "Subscribers: ")
+			if subscriberList == "" {
+				return nil
+			}
+			// Split by comma and trim whitespace
+			parts := strings.Split(subscriberList, ",")
+			var subscribers []string
+			for _, p := range parts {
+				s := strings.TrimSpace(p)
+				if s != "" {
+					subscribers = append(subscribers, s)
+				}
+			}
+			return subscribers
+		}
+		// Also support legacy "Notify: " format (single subscriber)
+		if strings.HasPrefix(line, "Notify: ") {
+			addr := strings.TrimPrefix(line, "Notify: ")
+			if addr != "" {
+				return []string{addr}
+			}
+		}
+	}
+	return nil
+}
+
+// updateSubscribersInDescription updates or adds the Subscribers line in description.
+func updateSubscribersInDescription(desc string, subscribers []string) string {
+	subscriberLine := fmt.Sprintf("Subscribers: %s", strings.Join(subscribers, ", "))
+
+	var lines []string
+	foundSubscribers := false
+	foundNotify := false
+
+	for _, line := range strings.Split(desc, "\n") {
+		if strings.HasPrefix(line, "Subscribers: ") {
+			lines = append(lines, subscriberLine)
+			foundSubscribers = true
+		} else if strings.HasPrefix(line, "Notify: ") {
+			// Replace legacy Notify with new Subscribers format
+			lines = append(lines, subscriberLine)
+			foundNotify = true
+		} else {
+			lines = append(lines, line)
+		}
+	}
+
+	// Add Subscribers line if not found
+	if !foundSubscribers && !foundNotify {
+		// Insert after first line (the summary)
+		if len(lines) > 0 {
+			lines = append([]string{lines[0], subscriberLine}, lines[1:]...)
+		} else {
+			lines = []string{subscriberLine}
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// getBlockedIssueIDs returns a set of issue IDs that are currently blocked.
+func getBlockedIssueIDs() map[string]bool {
+	blocked := make(map[string]bool)
+
+	// Run bd blocked --json
+	blockedCmd := exec.Command("bd", "blocked", "--json")
+	var stdout bytes.Buffer
+	blockedCmd.Stdout = &stdout
+
+	if err := blockedCmd.Run(); err != nil {
+		return blocked // Return empty set on error
+	}
+
+	var issues []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
+		return blocked
+	}
+
+	for _, issue := range issues {
+		blocked[issue.ID] = true
+	}
+
+	return blocked
+}
 // isReadyIssue checks if an issue is ready for dispatch (stranded).
 // An issue is ready if:
 // - status = "open" (not in_progress, closed, hooked)
@@ -650,9 +848,9 @@ func checkAndCloseCompletedConvoys(townBeads string) ([]struct{ ID, Title string
 	return closed, nil
 }
 
-// notifyConvoyCompletion sends a notification if the convoy has a notify address.
+// notifyConvoyCompletion sends notifications to all convoy subscribers.
 func notifyConvoyCompletion(townBeads, convoyID, title string) {
-	// Get convoy description to find notify address
+	// Get convoy description to find subscribers
 	showArgs := []string{"show", convoyID, "--json"}
 	showCmd := exec.Command("bd", showArgs...)
 	showCmd.Dir = townBeads
@@ -670,21 +868,19 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 		return
 	}
 
-	// Parse notify address from description
-	desc := convoys[0].Description
-	for _, line := range strings.Split(desc, "\n") {
-		if strings.HasPrefix(line, "Notify: ") {
-			addr := strings.TrimPrefix(line, "Notify: ")
-			if addr != "" {
-				// Send notification via gt mail
-				mailArgs := []string{"mail", "send", addr,
-					"-s", fmt.Sprintf("🚚 Convoy landed: %s", title),
-					"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.", convoyID)}
-				mailCmd := exec.Command("gt", mailArgs...)
-				_ = mailCmd.Run() // Best effort, ignore errors
-			}
-			break
-		}
+	// Parse subscribers from description (handles both new Subscribers: and legacy Notify: formats)
+	subscribers := getSubscribersFromDescription(convoys[0].Description)
+	if len(subscribers) == 0 {
+		return
+	}
+
+	// Send notification to each subscriber
+	for _, addr := range subscribers {
+		mailArgs := []string{"mail", "send", addr,
+			"-s", fmt.Sprintf("🚚 Convoy landed: %s", title),
+			"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.", convoyID)}
+		mailCmd := exec.Command("gt", mailArgs...)
+		_ = mailCmd.Run() // Best effort, ignore errors
 	}
 }
 
@@ -761,22 +957,27 @@ func runConvoyStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Get subscribers from description
+	subscribers := getSubscribersFromDescription(convoy.Description)
+
 	if convoyStatusJSON {
 		type jsonStatus struct {
-			ID        string             `json:"id"`
-			Title     string             `json:"title"`
-			Status    string             `json:"status"`
-			Tracked   []trackedIssueInfo `json:"tracked"`
-			Completed int                `json:"completed"`
-			Total     int                `json:"total"`
+			ID          string             `json:"id"`
+			Title       string             `json:"title"`
+			Status      string             `json:"status"`
+			Subscribers []string           `json:"subscribers,omitempty"`
+			Tracked     []trackedIssueInfo `json:"tracked"`
+			Completed   int                `json:"completed"`
+			Total       int                `json:"total"`
 		}
 		out := jsonStatus{
-			ID:        convoy.ID,
-			Title:     convoy.Title,
-			Status:    convoy.Status,
-			Tracked:   tracked,
-			Completed: completed,
-			Total:     len(tracked),
+			ID:          convoy.ID,
+			Title:       convoy.Title,
+			Status:      convoy.Status,
+			Subscribers: subscribers,
+			Tracked:     tracked,
+			Completed:   completed,
+			Total:       len(tracked),
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -787,6 +988,9 @@ func runConvoyStatus(cmd *cobra.Command, args []string) error {
 	fmt.Printf("🚚 %s %s\n\n", style.Bold.Render(convoy.ID+":"), convoy.Title)
 	fmt.Printf("  Status:    %s\n", formatConvoyStatus(convoy.Status))
 	fmt.Printf("  Progress:  %d/%d completed\n", completed, len(tracked))
+	if len(subscribers) > 0 {
+		fmt.Printf("  Subscribers: %s\n", strings.Join(subscribers, ", "))
+	}
 	fmt.Printf("  Created:   %s\n", convoy.CreatedAt)
 	if convoy.ClosedAt != "" {
 		fmt.Printf("  Closed:    %s\n", convoy.ClosedAt)
