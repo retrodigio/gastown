@@ -491,9 +491,6 @@ func runConvoyStranded(cmd *cobra.Command, args []string) error {
 func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 	var stranded []strandedConvoyInfo
 
-	// Get blocked issues (we need this to filter out blocked issues)
-	blockedIssues := getBlockedIssueIDs()
-
 	// List all open convoys
 	listArgs := []string{"list", "--type=convoy", "--status=open", "--json"}
 	listCmd := exec.Command("bd", listArgs...)
@@ -520,10 +517,19 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 			continue
 		}
 
-		// Find ready issues (open, not blocked, no live assignee)
+		// Collect all tracked issue IDs for batch lookup
+		var trackedIDs []string
+		for _, t := range tracked {
+			trackedIDs = append(trackedIDs, t.ID)
+		}
+
+		// Batch fetch issue details including dependencies
+		detailsMap := getIssueDetailsBatch(trackedIDs)
+
+		// Find ready issues (open, not blocked by unmet dependencies, no live assignee)
 		var readyIssues []string
 		for _, t := range tracked {
-			if isReadyIssue(t, blockedIssues) {
+			if isReadyIssue(t, detailsMap) {
 				readyIssues = append(readyIssues, t.ID)
 			}
 		}
@@ -541,47 +547,25 @@ func findStrandedConvoys(townBeads string) ([]strandedConvoyInfo, error) {
 	return stranded, nil
 }
 
-// getBlockedIssueIDs returns a set of issue IDs that are currently blocked.
-func getBlockedIssueIDs() map[string]bool {
-	blocked := make(map[string]bool)
-
-	// Run bd blocked --json
-	blockedCmd := exec.Command("bd", "blocked", "--json")
-	var stdout bytes.Buffer
-	blockedCmd.Stdout = &stdout
-
-	if err := blockedCmd.Run(); err != nil {
-		return blocked // Return empty set on error
-	}
-
-	var issues []struct {
-		ID string `json:"id"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
-		return blocked
-	}
-
-	for _, issue := range issues {
-		blocked[issue.ID] = true
-	}
-
-	return blocked
-}
-
 // isReadyIssue checks if an issue is ready for dispatch (stranded).
 // An issue is ready if:
 // - status = "open" (not in_progress, closed, hooked)
-// - not in blocked set
+// - all blocking dependencies are closed
 // - no assignee OR assignee session is dead
-func isReadyIssue(t trackedIssueInfo, blockedIssues map[string]bool) bool {
+func isReadyIssue(t trackedIssueInfo, detailsMap map[string]*issueDetails) bool {
 	// Must be open status (not in_progress, closed, hooked)
 	if t.Status != "open" {
 		return false
 	}
 
-	// Must not be blocked
-	if blockedIssues[t.ID] {
-		return false
+	// Check for unmet blocking dependencies
+	if details, ok := detailsMap[t.ID]; ok {
+		for _, dep := range details.Dependencies {
+			// If any blocking dependency is not closed, this issue is blocked
+			if dep.Status != "closed" && dep.Status != "tombstone" {
+				return false
+			}
+		}
 	}
 
 	// Check assignee
@@ -1113,13 +1097,21 @@ func getTrackedIssues(townBeads, convoyID string) []trackedIssueInfo {
 	return tracked
 }
 
+// issueDependency holds info about a dependency.
+type issueDependency struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Type   string `json:"dependency_type"`
+}
+
 // issueDetails holds basic issue info.
 type issueDetails struct {
-	ID        string
-	Title     string
-	Status    string
-	IssueType string
-	Assignee  string
+	ID           string
+	Title        string
+	Status       string
+	IssueType    string
+	Assignee     string
+	Dependencies []issueDependency // Blocking dependencies (type=blocks)
 }
 
 // getIssueDetailsBatch fetches details for multiple issues in a single bd show call.
@@ -1151,24 +1143,40 @@ func getIssueDetailsBatch(issueIDs []string) map[string]*issueDetails {
 	}
 
 	var issues []struct {
-		ID        string `json:"id"`
-		Title     string `json:"title"`
-		Status    string `json:"status"`
-		IssueType string `json:"issue_type"`
-		Assignee  string `json:"assignee"`
+		ID           string `json:"id"`
+		Title        string `json:"title"`
+		Status       string `json:"status"`
+		IssueType    string `json:"issue_type"`
+		Assignee     string `json:"assignee"`
+		Dependencies []struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+			Type   string `json:"dependency_type"`
+		} `json:"dependencies,omitempty"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil {
 		return result
 	}
 
 	for _, issue := range issues {
-		result[issue.ID] = &issueDetails{
+		details := &issueDetails{
 			ID:        issue.ID,
 			Title:     issue.Title,
 			Status:    issue.Status,
 			IssueType: issue.IssueType,
 			Assignee:  issue.Assignee,
 		}
+		// Copy blocking dependencies (only type=blocks, not tracks/relates_to)
+		for _, dep := range issue.Dependencies {
+			if dep.Type == "blocks" || dep.Type == "" {
+				details.Dependencies = append(details.Dependencies, issueDependency{
+					ID:     dep.ID,
+					Status: dep.Status,
+					Type:   dep.Type,
+				})
+			}
+		}
+		result[issue.ID] = details
 	}
 
 	return result
@@ -1188,23 +1196,39 @@ func getIssueDetails(issueID string) *issueDetails {
 	}
 
 	var issues []struct {
-		ID        string `json:"id"`
-		Title     string `json:"title"`
-		Status    string `json:"status"`
-		IssueType string `json:"issue_type"`
-		Assignee  string `json:"assignee"`
+		ID           string `json:"id"`
+		Title        string `json:"title"`
+		Status       string `json:"status"`
+		IssueType    string `json:"issue_type"`
+		Assignee     string `json:"assignee"`
+		Dependencies []struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+			Type   string `json:"dependency_type"`
+		} `json:"dependencies,omitempty"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &issues); err != nil || len(issues) == 0 {
 		return nil
 	}
 
-	return &issueDetails{
+	details := &issueDetails{
 		ID:        issues[0].ID,
 		Title:     issues[0].Title,
 		Status:    issues[0].Status,
 		IssueType: issues[0].IssueType,
 		Assignee:  issues[0].Assignee,
 	}
+	// Copy blocking dependencies (only type=blocks, not tracks/relates_to)
+	for _, dep := range issues[0].Dependencies {
+		if dep.Type == "blocks" || dep.Type == "" {
+			details.Dependencies = append(details.Dependencies, issueDependency{
+				ID:     dep.ID,
+				Status: dep.Status,
+				Type:   dep.Type,
+			})
+		}
+	}
+	return details
 }
 
 // workerInfo holds info about a worker assigned to an issue.
