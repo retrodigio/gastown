@@ -115,9 +115,7 @@ func (m *Manager) Start(foreground bool) error {
 
 	if foreground {
 		// In foreground mode, check tmux session (no PID inference per ZFC)
-		townRoot := filepath.Dir(m.rig.Path)
-		agentCfg := config.ResolveAgentConfig(townRoot, m.rig.Path)
-		if running, _ := t.HasSession(sessionID); running && t.IsAgentRunning(sessionID, config.ExpectedPaneCommands(agentCfg)...) {
+		if running, _ := t.HasSession(sessionID); running && t.IsClaudeRunning(sessionID) {
 			return ErrAlreadyRunning
 		}
 
@@ -139,9 +137,7 @@ func (m *Manager) Start(foreground bool) error {
 	running, _ := t.HasSession(sessionID)
 	if running {
 		// Session exists - check if Claude is actually running (healthy vs zombie)
-		townRoot := filepath.Dir(m.rig.Path)
-		agentCfg := config.ResolveAgentConfig(townRoot, m.rig.Path)
-		if t.IsAgentRunning(sessionID, config.ExpectedPaneCommands(agentCfg)...) {
+		if t.IsClaudeRunning(sessionID) {
 			// Healthy - Claude is running
 			return ErrAlreadyRunning
 		}
