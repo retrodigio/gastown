@@ -126,10 +126,21 @@ func NewWithBeadsDir(workDir, beadsDir string) *Beads {
 }
 
 // run executes a bd command and returns stdout.
+// For write operations, uses --no-daemon to avoid daemon IPC overhead.
 func (b *Beads) run(args ...string) ([]byte, error) {
-	// Use --no-daemon for faster read operations (avoids daemon IPC overhead)
-	// The daemon is primarily useful for write coalescing, not reads
-	fullArgs := append([]string{"--no-daemon"}, args...)
+	return b.runWithFlags([]string{"--no-daemon"}, args...)
+}
+
+// runRead executes a bd read command with --allow-stale to prevent staleness
+// check failures when JSONL is newer than database (e.g., after git pull).
+// This is safe for read operations since we're just querying data.
+func (b *Beads) runRead(args ...string) ([]byte, error) {
+	return b.runWithFlags([]string{"--no-daemon", "--allow-stale"}, args...)
+}
+
+// runWithFlags executes a bd command with the given flags prepended.
+func (b *Beads) runWithFlags(flags []string, args ...string) ([]byte, error) {
+	fullArgs := append(flags, args...)
 	cmd := exec.Command("bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = b.workDir
 
@@ -207,7 +218,7 @@ func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
 		args = append(args, "--no-assignee")
 	}
 
-	out, err := b.run(args...)
+	out, err := b.runRead(args...)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +274,7 @@ func (b *Beads) GetAssignedIssue(assignee string) (*Issue, error) {
 
 // Ready returns issues that are ready to work (not blocked).
 func (b *Beads) Ready() ([]*Issue, error) {
-	out, err := b.run("ready", "--json")
+	out, err := b.runRead("ready", "--json")
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +291,7 @@ func (b *Beads) Ready() ([]*Issue, error) {
 // Uses bd ready --label flag for server-side filtering.
 // The issueType is converted to a gt:<type> label (e.g., "molecule" -> "gt:molecule").
 func (b *Beads) ReadyWithType(issueType string) ([]*Issue, error) {
-	out, err := b.run("ready", "--json", "--label", "gt:"+issueType, "-n", "100")
+	out, err := b.runRead("ready", "--json", "--label", "gt:"+issueType, "-n", "100")
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +306,7 @@ func (b *Beads) ReadyWithType(issueType string) ([]*Issue, error) {
 
 // Show returns detailed information about an issue.
 func (b *Beads) Show(id string) (*Issue, error) {
-	out, err := b.run("show", id, "--json")
+	out, err := b.runRead("show", id, "--json")
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +333,7 @@ func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
 
 	// bd show supports multiple IDs
 	args := append([]string{"show", "--json"}, ids...)
-	out, err := b.run(args...)
+	out, err := b.runRead(args...)
 	if err != nil {
 		// If bd fails, return empty map (some IDs might not exist)
 		return make(map[string]*Issue), nil
@@ -343,7 +354,7 @@ func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
 
 // Blocked returns issues that are blocked by dependencies.
 func (b *Beads) Blocked() ([]*Issue, error) {
-	out, err := b.run("blocked", "--json")
+	out, err := b.runRead("blocked", "--json")
 	if err != nil {
 		return nil, err
 	}
@@ -567,7 +578,7 @@ func (b *Beads) SyncFromMain() error {
 
 // GetSyncStatus returns the sync status without performing a sync.
 func (b *Beads) GetSyncStatus() (*SyncStatus, error) {
-	out, err := b.run("sync", "--status", "--json")
+	out, err := b.runRead("sync", "--status", "--json")
 	if err != nil {
 		// If sync branch doesn't exist, return empty status
 		if strings.Contains(err.Error(), "does not exist") {
@@ -586,7 +597,7 @@ func (b *Beads) GetSyncStatus() (*SyncStatus, error) {
 
 // Stats returns repository statistics.
 func (b *Beads) Stats() (string, error) {
-	out, err := b.run("stats")
+	out, err := b.runRead("stats")
 	if err != nil {
 		return "", err
 	}
